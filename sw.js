@@ -1,9 +1,9 @@
 /* Service worker: rende l'app installabile e veloce da riaprire.
    Prova sempre prima la rete (così gli aggiornamenti arrivano subito),
    e usa la copia salvata solo se la rete non risponde. */
-const VERSION = 'pta-v1.2';
+const VERSION = 'pta-v1.5';
 const SHELL = [
-  './', './index.html', './app.js', './engine.js', './manifest.webmanifest',
+  './', './index.html', './app.js', './engine.js', './config.js', './manifest.webmanifest',
   './tavolo-serif.woff', './icon-192.png', './icon-512.png', './icon-maskable-512.png', './apple-touch-icon.png',
 ];
 const CDN = 'https://cdn.jsdelivr.net/';

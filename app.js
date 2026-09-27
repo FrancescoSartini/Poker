@@ -13,7 +13,8 @@
   const PING_MS = 5000;
   const STALE_MS = 12000;
   const JOIN_WINDOW_MS = 120000;
-  const VERSION = '1.2';
+  const RECONNECT_WINDOW_MS = 180000;
+  const VERSION = '1.5';
   const FATAL = new Set(['browser-incompatible', 'invalid-id', 'invalid-key', 'ssl-unavailable', 'unavailable-id']);
 
   const $ = (s, el = document) => el.querySelector(s);
@@ -74,6 +75,78 @@
   function diagHTML() {
     if (!LOG.length) return '';
     return `<details class="diag"><summary>Dettagli tecnici</summary><pre>${esc(LOG.join('\n'))}</pre></details>`;
+  }
+
+  /* ---------- Server ponte (TURN) ----------
+     Serve quando i dispositivi non riescono a collegarsi direttamente
+     (dati mobili, reti Wi-Fi diverse). Si attiva compilando config.js. */
+  const PEERJS_TURN = { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' };
+  let ice = { list: null, at: 0, pending: null };
+
+  function turnConfigured() {
+    const cfg = window.PTA_CONFIG || {};
+    return !!(String(cfg.meteredApp || '').trim() && String(cfg.meteredKey || '').trim());
+  }
+
+  function loadIceServers() {
+    if (!turnConfigured()) return Promise.resolve(null);
+    if (ice.list && Date.now() - ice.at < 10 * 60 * 1000) return Promise.resolve(ice.list);
+    if (ice.pending) return ice.pending;
+    const cfg = window.PTA_CONFIG;
+    const appName = String(cfg.meteredApp).trim().replace(/^https?:\/\//, '').replace(/\.metered\.live.*$/, '');
+    const url = 'https://' + encodeURIComponent(appName) + '.metered.live/api/v1/turn/credentials?apiKey=' + encodeURIComponent(String(cfg.meteredKey).trim());
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = setTimeout(() => { if (ctrl) ctrl.abort(); }, 6000);
+    ice.pending = fetch(url, ctrl ? { signal: ctrl.signal } : {})
+      .then((r) => { if (!r.ok) throw new Error('risposta ' + r.status); return r.json(); })
+      .then((list) => {
+        if (!Array.isArray(list) || !list.length) throw new Error('risposta vuota');
+        ice.list = list;
+        ice.at = Date.now();
+        return list;
+      })
+      .catch((e) => { log('Server ponte non raggiungibile (' + ((e && e.message) || 'errore') + ')'); return ice.list; })
+      .finally(() => { clearTimeout(timer); ice.pending = null; });
+    return ice.pending;
+  }
+
+  function peerOptions(list) {
+    const o = { debug: 1 };
+    if (list && list.length) {
+      o.config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }].concat(list, [PEERJS_TURN]), sdpSemantics: 'unified-plan' };
+    }
+    return o;
+  }
+
+  function logIceSetup(list) {
+    if (list && list.length) log('Server ponte attivo');
+    else if (turnConfigured()) log('Server ponte configurato ma non disponibile: uso solo i server gratuiti di PeerJS');
+    else log('Server ponte non configurato');
+  }
+
+  // Scrive nel registro se due dispositivi si parlano direttamente o tramite il server ponte,
+  // e se la rete non trova nessuna strada.
+  function watchRoute(conn, who) {
+    const pc = conn && conn.peerConnection;
+    if (!pc || !pc.addEventListener) return;
+    pc.addEventListener('iceconnectionstatechange', () => {
+      if (pc.iceConnectionState === 'failed') log((who ? who + ': ' : '') + 'la rete non trova una strada tra i due dispositivi');
+    });
+    conn.on('open', () => setTimeout(() => {
+      if (!pc.getStats) return;
+      pc.getStats().then((stats) => {
+        const byId = {};
+        let pair = null;
+        stats.forEach((r) => { byId[r.id] = r; });
+        stats.forEach((r) => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = byId[r.selectedCandidatePairId]; });
+        if (!pair) stats.forEach((r) => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r; });
+        if (!pair) return;
+        const a = byId[pair.localCandidateId];
+        const b = byId[pair.remoteCandidateId];
+        const relay = (a && a.candidateType === 'relay') || (b && b.candidateType === 'relay');
+        log((who ? who + ': ' : '') + (relay ? 'collegati tramite server ponte' : 'collegamento diretto'));
+      }).catch(() => { /* statistiche non disponibili */ });
+    }, 1500));
   }
 
   /* ---------- Carte ---------- */
@@ -151,6 +224,9 @@
 
   /* ---------- Banco (host) ---------- */
   function hostCreate() {
+    // Ogni nuovo tavolo parte con il registro tecnico pulito.
+    LOG.length = 0;
+    log('Versione ' + VERSION + ' su ' + device());
     const P = PeerCtor();
     if (!P) { S.error = 'Non riesco a caricare il collegamento. Controlla internet e ricarica la pagina.'; return render(); }
     S.busy = true;
@@ -159,9 +235,10 @@
     const st = S.settings;
     const table = new Engine.Table({ startChips: st.chips, sb: st.sb, bb: st.sb * 2, blindEvery: st.every });
     let attempt = 0;
+    let iceList = null;
     const tryOpen = () => {
       const code = genCode();
-      const peer = new P(PREFIX + code, { debug: 1 });
+      const peer = new P(PREFIX + code, peerOptions(iceList));
       let opened = false;
       peer.on('open', () => {
         // PeerJS ripete l'evento "open" ogni volta che si ricollega al servizio:
@@ -184,7 +261,7 @@
         acquireWake();
         hostTick();
       });
-      peer.on('connection', (conn) => { log('Qualcuno sta entrando'); hostOnConn(conn); });
+      peer.on('connection', (conn) => { log('Qualcuno sta entrando'); watchRoute(conn, 'Giocatore'); hostOnConn(conn); });
       peer.on('disconnected', () => {
         if (H.peer === peer && !peer.destroyed) log('Tavolo non raggiungibile: mi ricollego');
         if (!peer.destroyed && H.peer === peer) setTimeout(() => { try { if (peer.disconnected && !peer.destroyed) peer.reconnect(); } catch (e) { /* riprova dopo */ } }, 1500);
@@ -200,7 +277,7 @@
         }
       });
     };
-    tryOpen();
+    loadIceServers().then((list) => { iceList = list; logIceSetup(list); tryOpen(); });
   }
 
   function hostOnConn(conn) {
@@ -287,6 +364,7 @@
       return;
     }
     if (!info) return;
+    if (msg.t === 'ping') { send(conn, { t: 'pong' }); return; }
     if (msg.t === 'act') {
       const err = t.act(info.pid, String(msg.a), msg.amount);
       if (err) send(conn, { t: 'err', msg: err });
@@ -383,43 +461,80 @@
   }
 
   /* ---------- Giocatore (client) ---------- */
-  function clientJoin() {
+  // Crea un collegamento nuovo al servizio. Per chi entra conviene ripartire sempre
+  // da zero: dopo una pausa (schermo spento, app in background) il vecchio può
+  // sembrare vivo ma non funzionare più.
+  function freshPeer(onReady) {
     const P = PeerCtor();
-    if (!P) { log('Libreria di collegamento non caricata'); S.error = 'Non riesco a caricare il collegamento. Controlla internet e ricarica la pagina.'; return render(); }
-    S.busy = true;
-    S.error = '';
-    S.joinNote = '';
-    S.code = S.joinCode;
-    S.role = 'guest';
-    C.closing = false;
-    C.tries = 0;
-    C.attempts = 0;
-    C.lastErr = null;
-    C.joinStart = Date.now();
-    log('Cerco il tavolo ' + S.code);
-    render();
-    const peer = new P({ debug: 1 });
+    if (!P) return false;
+    const old = C.peer;
+    C.conn = null;
+    if (old) { try { old.destroy(); } catch (e) { /* ignora */ } }
+    const peer = new P(peerOptions(C.ice));
     C.peer = peer;
     let opened = false;
     peer.on('open', () => {
-      // Anche qui "open" si ripete dopo ogni ricollegamento: si parte una volta sola.
-      if (opened) { log('Di nuovo collegato al servizio'); return; }
+      if (C.peer !== peer || C.closing) return;
+      if (opened) return; // "open" si ripete dopo ogni ricollegamento
       opened = true;
       log('Collegato al servizio');
-      clientConnect();
+      onReady();
     });
     peer.on('error', (err) => {
       if (C.peer !== peer || C.closing) return;
       const type = err && err.type;
       C.lastErr = type;
       log('Errore: ' + type);
-      if (S.joined) return; // a partita iniziata ci pensa il ricollegamento automatico
-      if (!opened || FATAL.has(type)) return joinFailed(peerError(err));
-      if (C.conn && !C.conn.open) joinAttemptFailed(C.conn);
+      if (!S.joined) {
+        if (!opened || FATAL.has(type)) return joinFailed(peerError(err));
+        if (C.conn && !C.conn.open) joinAttemptFailed(C.conn);
+      } else if (!opened) {
+        onClientLost('Servizio non raggiungibile');
+      } else if (C.conn && !C.conn.open) {
+        onClientLost('Il tavolo non risponde');
+      }
     });
+    // Se il servizio non risponde entro qualche secondo, si riprova da capo.
+    setTimeout(() => {
+      if (opened || C.peer !== peer || C.closing) return;
+      log('Il servizio non risponde');
+      if (S.joined) return onClientLost('Servizio non raggiungibile');
+      if (Date.now() - C.joinStart > JOIN_WINDOW_MS) return joinFailed(peerError({ type: 'network' }));
+      freshPeer(onReady);
+    }, 8000);
     peer.on('disconnected', () => {
-      if (!C.closing && C.peer === peer) log('Collegamento al servizio perso');
-      if (!C.closing && C.peer === peer) setTimeout(() => { try { if (peer.disconnected && !peer.destroyed) peer.reconnect(); } catch (e) { /* riprova */ } }, 1500);
+      if (C.closing || C.peer !== peer) return;
+      log('Collegamento al servizio perso');
+      setTimeout(() => { try { if (C.peer === peer && peer.disconnected && !peer.destroyed) peer.reconnect(); } catch (e) { /* riprova */ } }, 1500);
+    });
+    return true;
+  }
+
+  function clientJoin() {
+    if (!PeerCtor()) { log('Libreria di collegamento non caricata'); S.error = 'Non riesco a caricare il collegamento. Controlla internet e ricarica la pagina.'; return render(); }
+    S.busy = true;
+    S.error = '';
+    S.joinNote = '';
+    S.code = S.joinCode;
+    S.role = 'guest';
+    C.closing = false;
+    C.attempts = 0;
+    C.lastErr = null;
+    C.lostSince = 0;
+    C.joinStart = Date.now();
+    // Il registro riparte da zero quando si entra in un tavolo diverso dal precedente.
+    if (C.logCode !== S.code) {
+      LOG.length = 0;
+      log('Versione ' + VERSION + ' su ' + device());
+      C.logCode = S.code;
+    }
+    log('Cerco il tavolo ' + S.code);
+    render();
+    loadIceServers().then((list) => {
+      if (C.closing) return;
+      C.ice = list;
+      logIceSetup(list);
+      freshPeer(() => clientConnect());
     });
   }
 
@@ -453,49 +568,76 @@
 
   function clientConnect() {
     if (C.closing || !C.peer) return;
-    const conn = C.peer.connect(PREFIX + S.code, { reliable: true, serialization: 'json' });
+    let conn = null;
+    try { conn = C.peer.connect(PREFIX + S.code, { reliable: true, serialization: 'json' }); } catch (e) { conn = null; }
+    if (!conn) {
+      // Il servizio non è pronto: si riprova con un collegamento nuovo.
+      if (!S.joined) { C.conn = null; return setTimeout(() => { if (!C.closing && !S.joined) freshPeer(() => clientConnect()); }, 2000); }
+      return onClientLost('Servizio non pronto');
+    }
     C.conn = conn;
-    if (!S.joined) log('Tentativo ' + (C.attempts + 1) + ': busso al tavolo');
+    log(S.joined ? 'Mi ricollego al tavolo' : 'Tentativo ' + (C.attempts + 1) + ': busso al tavolo');
+    watchRoute(conn, '');
+    let welcomed = false;
     let dead = false;
-    const lost = () => {
+    const lost = (why) => {
       if (dead || C.conn !== conn) return;
       if (!S.joined) return joinAttemptFailed(conn);
       dead = true;
-      onClientLost();
+      onClientLost(why);
     };
     // Tempo massimo per aprire il canale e ricevere il benvenuto.
-    const timer = setTimeout(() => { if (!S.joined || !conn.open) { log('Nessuna risposta dal tavolo'); lost(); } }, 10000);
+    const timer = setTimeout(() => { if (!welcomed) { log('Nessuna risposta dal tavolo'); lost(); } }, 10000);
     conn.on('open', () => {
+      if (C.conn !== conn) return;
       log('Canale aperto, mi presento');
       C.seen = Date.now();
       send(conn, { t: 'hello', name: cleanName(S.name), cid });
     });
     conn.on('data', (msg) => {
+      if (C.conn !== conn) return;
       C.seen = Date.now();
-      if (msg && msg.t === 'welcome') { clearTimeout(timer); log('Entrato al tavolo'); }
+      if (msg && msg.t === 'welcome') { welcomed = true; clearTimeout(timer); }
       clientOnMsg(msg);
     });
-    conn.on('close', () => { clearTimeout(timer); if (C.conn === conn && !conn._failed) log('Canale chiuso'); lost(); });
-    conn.on('error', () => { if (!conn.open) { clearTimeout(timer); lost(); } });
+    conn.on('close', () => { clearTimeout(timer); lost('Canale chiuso'); });
+    conn.on('error', () => { if (!conn.open) { clearTimeout(timer); lost('Canale non disponibile'); } });
   }
 
-  function onClientLost() {
-    if (C.closing) return;
-    if (C.tries >= 6) { S.status = 'lost'; return render(); }
+  // Collegamento perso a partita in corso: si riprova da soli per qualche minuto,
+  // ogni volta con un collegamento nuovo.
+  function onClientLost(why) {
+    if (C.closing || !S.joined) return;
+    if (why) log(why);
+    const old = C.conn;
+    C.conn = null;
+    if (old) { try { old.close(); } catch (e) { /* ignora */ } }
+    if (!C.lostSince) C.lostSince = Date.now();
+    if (Date.now() - C.lostSince > RECONNECT_WINDOW_MS) {
+      log('Rinuncio a ricollegarmi');
+      S.status = 'lost';
+      return render();
+    }
     S.status = 'reconnecting';
     render();
-    C.tries++;
-    setTimeout(() => {
-      if (C.closing || !C.peer) return;
-      try { if (C.peer.disconnected && !C.peer.destroyed) C.peer.reconnect(); } catch (e) { /* ignora */ }
-      clientConnect();
-    }, 2000);
+    clearTimeout(C.retryTimer);
+    const first = Date.now() - C.lostSince < 1000;
+    C.retryTimer = setTimeout(() => {
+      if (C.closing) return;
+      loadIceServers().then((list) => {
+        if (C.closing) return;
+        if (list) C.ice = list;
+        freshPeer(() => clientConnect());
+      });
+    }, first ? 300 : 2500);
   }
 
   function clientOnMsg(msg) {
     if (!msg || typeof msg !== 'object') return;
     if (msg.t === 'welcome') {
       S.myId = msg.pid;
+      log(S.joined ? 'Di nuovo al tavolo' : 'Entrato al tavolo');
+      C.lostSince = 0;
       if (!S.joined) {
         S.joined = true;
         history.replaceState(null, '', location.pathname);
@@ -505,10 +647,8 @@
       S.busy = false;
       S.joinNote = '';
       S.status = 'ok';
-      C.tries = 0;
       acquireWake();
     } else if (msg.t === 'view') {
-      if (S.status !== 'ok') S.status = 'ok';
       onView(msg.v);
     } else if (msg.t === 'deny') {
       clientTeardown();
@@ -523,31 +663,31 @@
   }
 
   function clientPing() {
-    if (!S.joined || C.closing) return;
+    if (!S.joined || C.closing || S.status !== 'ok') return;
     send(C.conn, { t: 'ping' });
-    if (S.status === 'ok' && Date.now() - C.seen > 16000 && C.conn) {
-      const c = C.conn;
-      try { c.close(); } catch (e) { /* ignora */ }
-      if (C.conn === c) onClientLost();
-    }
+    if (C.conn && Date.now() - C.seen > STALE_MS) onClientLost('Nessun segnale dal banco da ' + Math.round((Date.now() - C.seen) / 1000) + ' secondi');
+  }
+
+  // Al ritorno nell'app (schermo riacceso, cambio app) si controlla subito il collegamento.
+  function clientResume() {
+    if (S.role !== 'guest' || !S.joined || C.closing || S.status !== 'ok') return;
+    const at = Date.now();
+    if (!C.conn || !C.conn.open || at - C.seen > STALE_MS) return onClientLost('Collegamento caduto durante la pausa');
+    send(C.conn, { t: 'ping' });
+    setTimeout(() => {
+      if (S.status === 'ok' && C.seen < at && !C.closing) onClientLost('Il banco non risponde dopo la pausa');
+    }, 4000);
   }
 
   function clientRetry() {
-    C.tries = 0;
-    S.status = 'reconnecting';
-    render();
-    if (!C.peer || C.peer.destroyed) {
-      const P = PeerCtor();
-      C.peer = new P({ debug: 1 });
-      C.peer.on('open', () => clientConnect());
-      return;
-    }
-    clientConnect();
+    C.lostSince = Date.now();
+    onClientLost('Nuovo tentativo richiesto');
   }
 
   function clientTeardown() {
     C.closing = true;
     clearInterval(C.ping);
+    clearTimeout(C.retryTimer);
     try { C.conn && C.conn.close(); } catch (e) { /* ignora */ }
     try { C.peer && C.peer.destroy(); } catch (e) { /* ignora */ }
     C.peer = null;
@@ -715,7 +855,8 @@
       ${host
         ? `<button class="btn primary" data-act="start" ${n < 2 ? 'disabled' : ''}>${n < 2 ? 'Aspetta almeno un amico' : 'Inizia la partita'}</button>
            <p class="note">Tieni l'app aperta durante la partita: il tuo telefono fa da banco.</p>`
-        : `<p class="msg">Aspetta che <strong>${esc(hostName)}</strong> inizi la partita.</p>`}
+        : `<p class="msg">Aspetta che <strong>${esc(hostName)}</strong> inizi la partita.</p>
+           <p class="note">Durante la partita tieni lo schermo acceso e l'app aperta.</p>`}
       <button class="btn ghost" data-act="leave">${host ? 'Chiudi il tavolo' : 'Esci dal tavolo'}</button>
       ${diagHTML()}
     </main>`;
@@ -780,8 +921,8 @@
 
   function statusBanner() {
     if (S.role !== 'guest' || S.status === 'ok') return '';
-    if (S.status === 'reconnecting') return '<div class="banner" role="alert"><span class="grow"><span class="spin"></span>Connessione persa, mi ricollego…</span></div>';
-    return `<div class="banner" role="alert"><span class="grow">Il tavolo non risponde. Il banco potrebbe aver chiuso l'app.</span><button data-act="retry">Riprova</button></div>`;
+    if (S.status === 'reconnecting') return `<div class="banner" role="alert"><span class="grow"><span class="spin"></span>Connessione persa, mi ricollego…<br><small>Succede se lo schermo si spegne o esci dall'app.</small></span>${diagHTML()}</div>`;
+    return `<div class="banner" role="alert"><span class="grow">Il tavolo non risponde. Chi l'ha creato potrebbe aver chiuso l'app.</span><button data-act="retry">Riprova</button>${diagHTML()}</div>`;
   }
 
   function seatHTML(p, i, v, winners) {
@@ -840,6 +981,7 @@
   }
 
   function barHTML(v, me, host) {
+    if (S.role === 'guest' && S.status !== 'ok') return '<p class="msg">Aspetto di ricollegarmi al tavolo…</p>';
     const a = v.actions;
     if (a && S.raiseOpen) {
       return `<div class="raise" role="group" aria-label="Scegli quanto puntare">
@@ -978,6 +1120,7 @@
   }
 
   app.addEventListener('click', (e) => {
+    if (S.joined) acquireWake();
     const b = e.target.closest('[data-act]');
     if (!b || b.disabled) return;
     const fn = actions[b.dataset.act];
@@ -1027,7 +1170,7 @@
     if (S.joined) acquireWake();
     if (S.role === 'host') log('App del banco di nuovo in primo piano');
     if (S.role === 'host' && H.peer && H.peer.disconnected && !H.peer.destroyed) { try { H.peer.reconnect(); } catch (e) { /* ignora */ } }
-    if (S.role === 'guest' && S.joined && S.status === 'ok' && C.conn && !C.conn.open) onClientLost();
+    if (S.role === 'guest') { log('App di nuovo in primo piano'); clientResume(); }
   });
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
