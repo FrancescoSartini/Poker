@@ -117,6 +117,11 @@
       this.blindEvery = opts.blindEvery || 0;
       this.autoRunout = !!opts.autoRunout;
       this.maxPlayers = opts.maxPlayers || 8;
+      this.turnMs = opts.turnMs || 30000;
+      this.turnSeq = 0;
+      this.turnStart = 0;
+      this.actSeq = 0;
+      this.lastAct = null;
       this.players = [];
       this.phase = 'lobby'; // lobby | playing | handover | paused
       this.handNo = 0;
@@ -309,6 +314,8 @@
       } else {
         return 'Azione non valida';
       }
+      this.actSeq++;
+      this.lastAct = { seq: this.actSeq, pid: p.id, kind: p.allIn && a !== 'fold' && a !== 'check' ? 'allin' : a };
       this.seq++;
       this.progress(i);
       return null;
@@ -322,7 +329,7 @@
       let done = pending.length === 0;
       if (!done && actors.length === 1 && actors[0].bet >= this.currentBet) done = true;
       if (done) return this.endStreet();
-      this.toAct = this.nextIdx(lastIdx, (p) => pending.includes(p));
+      this.setTurn(this.nextIdx(lastIdx, (p) => pending.includes(p)));
       this.seq++;
     }
 
@@ -346,8 +353,28 @@
         return;
       }
       this.dealStreet();
-      this.toAct = this.nextIdx(this.dealer, (p) => this.canAct(p));
+      this.setTurn(this.nextIdx(this.dealer, (p) => this.canAct(p)));
       this.seq++;
+    }
+
+    // Ogni nuovo turno ha un numero proprio e parte il suo conto alla rovescia.
+    setTurn(i) {
+      this.toAct = i;
+      this.turnSeq++;
+      this.turnStart = Date.now();
+    }
+
+    // Tempo scaduto: check se non c'è niente da chiamare, altrimenti si passa.
+    timeoutAct() {
+      if (this.phase !== 'playing' || this.runout || this.toAct < 0) return false;
+      const p = this.players[this.toAct];
+      const canCheck = this.currentBet <= p.bet;
+      const street = this.street;
+      const hand = this.handNo;
+      this.act(p.id, canCheck ? 'check' : 'fold');
+      if (p.folded || (this.street === street && this.handNo === hand)) p.lastAction = canCheck ? 'Tempo scaduto, check' : 'Tempo scaduto, passa';
+      if (this.lastAct) this.lastAct.timeout = true;
+      return true;
     }
 
     dealStreet() {
@@ -459,6 +486,10 @@
         champion: this.champion,
         me: meIdx,
         toAct: this.toAct,
+        turnSeq: this.turnSeq,
+        turnMs: this.turnMs,
+        turnLeft: this.phase === 'playing' && !this.runout && this.toAct >= 0 ? Math.max(0, this.turnStart + this.turnMs - Date.now()) : 0,
+        lastAct: this.lastAct,
         maxPlayers: this.maxPlayers,
         players: this.players.map((p, i) => {
           const showCards = p.inHand && !p.folded && (i === meIdx || (p.revealed && reveal));

@@ -14,7 +14,7 @@
   const STALE_MS = 12000;
   const JOIN_WINDOW_MS = 120000;
   const RECONNECT_WINDOW_MS = 180000;
-  const VERSION = '1.6';
+  const VERSION = '1.8';
   const FATAL = new Set(['browser-incompatible', 'invalid-id', 'invalid-key', 'ssl-unavailable', 'unavailable-id']);
 
   const $ = (s, el = document) => el.querySelector(s);
@@ -187,6 +187,97 @@
     }, 1500));
   }
 
+  /* ---------- Suoni ----------
+     Generati al momento con il browser: nessun file audio da scaricare. */
+  const Sound = (() => {
+    let ctx = null;
+    let noise = null;
+    let on = store.get('sound', true);
+    function ensure() {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!ctx) { try { ctx = new AC(); } catch (e) { return null; } }
+      if (ctx.state === 'suspended') ctx.resume().catch(() => { /* serve un tocco */ });
+      return ctx;
+    }
+    // I telefoni fanno partire l'audio solo dopo un tocco: lo si "sblocca" al primo.
+    function unlock() {
+      const c = ensure();
+      if (!c) return;
+      try {
+        const src = c.createBufferSource();
+        src.buffer = c.createBuffer(1, 1, 22050);
+        src.connect(c.destination);
+        src.start(0);
+      } catch (e) { /* ignora */ }
+    }
+    function noiseBuf(c) {
+      if (noise) return noise;
+      noise = c.createBuffer(1, Math.floor(c.sampleRate * 0.1), c.sampleRate);
+      const d = noise.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      return noise;
+    }
+    // Un colpo di fiche: un breve fruscio filtrato con una piccola risonanza.
+    function clack(c, t, gain, freq) {
+      const src = c.createBufferSource();
+      src.buffer = noiseBuf(c);
+      const bp = c.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = freq;
+      bp.Q.value = 7;
+      const g = c.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + 0.002);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(c.destination);
+      src.start(t);
+      src.stop(t + 0.09);
+    }
+    function tone(c, t, freq, dur, gain, type) {
+      const o = c.createOscillator();
+      const g = c.createGain();
+      o.type = type || 'sine';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g);
+      g.connect(c.destination);
+      o.start(t);
+      o.stop(t + dur + 0.02);
+    }
+    function ready() { return on ? ensure() : null; }
+    return {
+      unlock,
+      get on() { return on; },
+      toggle() { on = !on; store.set('sound', on); if (on) unlock(); return on; },
+      chips(big) {
+        const c = ready();
+        if (!c) return;
+        const t0 = c.currentTime + 0.01;
+        const hits = big ? 7 : 4;
+        for (let i = 0; i < hits; i++) clack(c, t0 + i * 0.05 + Math.random() * 0.02, 0.5 * (1 - i * 0.07), 2400 + Math.random() * 2200);
+      },
+      // Il turno passa a un altro: un tocco leggero.
+      turn() {
+        const c = ready();
+        if (!c) return;
+        tone(c, c.currentTime + 0.01, 1175, 0.09, 0.08, 'triangle');
+      },
+      // Tocca a te: due note ascendenti, più presenti.
+      myTurn() {
+        const c = ready();
+        if (!c) return;
+        const t = c.currentTime + 0.01;
+        tone(c, t, 784, 0.18, 0.22, 'sine');
+        tone(c, t + 0.14, 1175, 0.28, 0.22, 'sine');
+      },
+    };
+  })();
+
   /* ---------- Carte ---------- */
   const SUIT = {
     s: 'M12 2C9.6 5.4 3.5 9 3.5 13.4c0 2.7 2.1 4.6 4.5 4.6 1.4 0 2.6-.6 3.4-1.6-.3 2-1.2 3.6-2.7 5.1h7.6c-1.5-1.5-2.4-3.1-2.7-5.1.8 1 2 1.6 3.4 1.6 2.4 0 4.5-1.9 4.5-4.6C20.5 9 14.4 5.4 12 2z',
@@ -194,6 +285,8 @@
     d: 'M12 1.8l7.8 10.2L12 22.2 4.2 12z',
     c: 'M12 2.2a4.3 4.3 0 0 0-4 5.9 4.3 4.3 0 1 0 2.6 7.3c-.3 2-1.1 3.7-2.6 5.4h8c-1.5-1.7-2.3-3.4-2.6-5.4a4.3 4.3 0 1 0 2.6-7.3 4.3 4.3 0 0 0-4-5.9z',
   };
+  const ICON_SOUND = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+  const ICON_MUTE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16.5 9.5l5 5M21.5 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
   const SUIT_NAME = { s: 'picche', h: 'cuori', d: 'quadri', c: 'fiori' };
   const RANK_NAME = { A: 'Asso', K: 'Re', Q: 'Donna', J: 'Jack', T: '10' };
   const rankTxt = (r) => (r === 'T' ? '10' : r);
@@ -205,6 +298,67 @@
     return `<div class="card${red ? ' red' : ''}${cls ? ' ' + cls : ''}"${style} role="img" aria-label="${label}"><b>${rankTxt(c[0])}</b><svg viewBox="0 0 24 24" aria-hidden="true"><path d="${SUIT[c[1]]}"/></svg></div>`;
   }
   const backHTML = (cls, i) => `<div class="card back${cls ? ' ' + cls : ''}"${i != null ? ` style="--i:${i}"` : ''} aria-hidden="true"></div>`;
+
+  /* ---------- Montagnetta di fiches ----------
+     Più fiches hai rispetto a quelle di partenza, più è alta. */
+  const CHIP_COLORS = [
+    ['#D2A74A', '#9A7631', '#F8F3E7'], // ottone
+    ['#B3261E', '#7C1914', '#F8F3E7'], // rosso
+    ['#EFE8D8', '#BFB39A', '#B3261E'], // avorio
+    ['#1F6B50', '#12402F', '#F8F3E7'], // verde
+    ['#2B2825', '#121110', '#D2A74A'], // nero
+  ];
+
+  function chipSVG(x, y, rx, col) {
+    const ry = rx * 0.36;
+    const h = rx * 0.28;
+    const [top, side, edge] = col;
+    const sw = rx * 0.22;
+    return `<path d="M${x - rx},${y}v${h}a${rx},${ry} 0 0 0 ${2 * rx},0v${-h}z" fill="${side}"/>` +
+      `<rect x="${x - rx * 0.7 - sw / 2}" y="${y + ry * 0.55}" width="${sw}" height="${h}" fill="${edge}" opacity=".85"/>` +
+      `<rect x="${x - sw / 2}" y="${y + ry}" width="${sw}" height="${h}" fill="${edge}" opacity=".85"/>` +
+      `<rect x="${x + rx * 0.7 - sw / 2}" y="${y + ry * 0.55}" width="${sw}" height="${h}" fill="${edge}" opacity=".85"/>` +
+      `<ellipse cx="${x}" cy="${y}" rx="${rx}" ry="${ry}" fill="${top}"/>` +
+      `<ellipse cx="${x}" cy="${y}" rx="${rx * 0.62}" ry="${ry * 0.62}" fill="none" stroke="${edge}" stroke-width="${rx * 0.09}" stroke-dasharray="${rx * 0.22} ${rx * 0.18}" opacity=".9"/>`;
+  }
+
+  function stackSVG(x, baseY, count, rx, col) {
+    let out = '';
+    const step = rx * 0.28;
+    for (let i = 0; i < count; i++) out += chipSVG(x, baseY - i * step, rx, col);
+    return out;
+  }
+
+  // Montagnetta grande (il tuo posto): fino a cinque pile di colori diversi.
+  function pileHTML(chips, start) {
+    if (!chips) return '';
+    const n = Math.max(1, Math.min(60, Math.round((chips / (start || 1000)) * 12)));
+    // Si aggiunge una fiche alla volta alla pila più "indietro" rispetto al suo peso:
+    // così con più fiches ogni pila può solo crescere.
+    const weights = [0.28, 0.2, 0.2, 0.16, 0.16];
+    const capped = [0, 0, 0, 0, 0];
+    for (let k = 0; k < n; k++) {
+      let best = -1;
+      for (let i = 0; i < 5; i++) if (capped[i] < 16 && (best < 0 || capped[i] / weights[i] < capped[best] / weights[best])) best = i;
+      if (best < 0) break;
+      capped[best]++;
+    }
+    // posizione, colore; si disegnano prima le pile dietro
+    const spots = [
+      { x: 70, y: 84, c: 0 }, { x: 38, y: 82, c: 1 }, { x: 102, y: 82, c: 2 },
+      { x: 54, y: 70, c: 3 }, { x: 86, y: 70, c: 4 },
+    ];
+    const order = [3, 4, 1, 2, 0];
+    const body = order.map((i) => stackSVG(spots[i].x, spots[i].y, capped[i], 14, CHIP_COLORS[spots[i].c])).join('');
+    return `<svg class="pile" viewBox="18 12 104 82" aria-hidden="true">${body}</svg>`;
+  }
+
+  // Pila piccola (riquadri degli avversari): una sola colonna.
+  function miniPileHTML(chips, start) {
+    if (!chips) return '<span class="minipile"></span>';
+    const n = Math.max(1, Math.min(9, Math.round((chips / (start || 1000)) * 4)));
+    return `<svg class="minipile" viewBox="0 0 18 26" aria-hidden="true">${stackSVG(9, 22, n, 7, CHIP_COLORS[0])}</svg>`;
+  }
 
   /* ---------- Utilità ---------- */
   let toastTimer = null;
@@ -448,6 +602,7 @@
 
   function clearHostTimers() {
     for (const k of Object.keys(H.timers)) { clearTimeout(H.timers[k]); delete H.timers[k]; }
+    H.turnKey = null;
   }
 
   function hostTick() {
@@ -472,7 +627,19 @@
       }, RUNOUT_MS);
     }
     if (t.phase === 'playing' && !t.runout && t.toAct >= 0 && !t.players[t.toAct].connected && !H.timers.auto) {
-      H.timers.auto = setTimeout(() => { delete H.timers.auto; hostAutoAct(false); }, AUTO_MS);
+      H.timers.auto = setTimeout(() => { delete H.timers.auto; hostAutoAct(); }, AUTO_MS);
+    }
+    // Tempo del turno: allo scadere il banco fa check o passa al posto del giocatore.
+    if (t.phase === 'playing' && !t.runout && t.toAct >= 0 && H.turnKey !== t.turnSeq) {
+      clearTimeout(H.timers.turn);
+      const key = t.turnSeq;
+      H.turnKey = key;
+      const left = Math.max(0, t.turnStart + t.turnMs - Date.now());
+      H.timers.turn = setTimeout(() => {
+        delete H.timers.turn;
+        const tb = H.table;
+        if (tb && tb.turnSeq === key && tb.phase === 'playing' && !tb.runout) { tb.timeoutAct(); hostTick(); }
+      }, left + 300);
     }
     for (const [conn, info] of H.conns) if (info.welcomed) send(conn, { t: 'view', v: t.viewFor(info.pid) });
     onView(t.viewFor(S.myId));
@@ -489,11 +656,11 @@
     hostTick();
   }
 
-  function hostAutoAct(force) {
+  function hostAutoAct() {
     const t = H.table;
     if (!t || t.phase !== 'playing' || t.runout || t.toAct < 0) return;
     const p = t.players[t.toAct];
-    if (p.connected && !force) return;
+    if (p.connected) return;
     t.act(p.id, t.currentBet > p.bet ? 'fold' : 'check');
     hostTick();
   }
@@ -812,6 +979,8 @@
     };
     const wasTurn = !!(prev && prev.actions);
     const isTurn = !!v.actions;
+    S.turnDeadline = v.turnLeft > 0 ? Date.now() + v.turnLeft : 0;
+    if (prev) playSounds(prev, v);
     if (isTurn && !wasTurn) {
       S.raiseOpen = false;
       try { navigator.vibrate && navigator.vibrate(90); } catch (e) { /* ignora */ }
@@ -824,6 +993,43 @@
       const meEl = $('.me');
       if (meEl) meEl.scrollIntoView({ block: 'nearest', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
     }
+  }
+
+  function playSounds(prev, v) {
+    let delay = 0;
+    const a = v.lastAct;
+    if (a && (!prev.lastAct || prev.lastAct.seq !== a.seq) && (a.kind === 'raise' || a.kind === 'allin' || a.kind === 'call')) {
+      Sound.chips(a.kind === 'allin');
+      delay = 260;
+    }
+    const newTurn = v.phase === 'playing' && !v.runout && v.toAct >= 0 && v.turnSeq !== prev.turnSeq;
+    if (newTurn) {
+      const mine = !!v.actions;
+      setTimeout(() => (mine ? Sound.myTurn() : Sound.turn()), delay);
+    }
+  }
+
+  // Aggiorna i secondi rimasti senza ridisegnare la pagina.
+  function tickTimers() {
+    const left = S.turnDeadline ? S.turnDeadline - Date.now() : 0;
+    document.querySelectorAll('[data-timer]').forEach((el) => {
+      el.classList.toggle('low', left < 10000);
+      const cd = el.querySelector('.cd');
+      if (cd) cd.textContent = Math.max(0, Math.ceil(left / 1000)) + ' s';
+    });
+  }
+  setInterval(tickTimers, 250);
+
+  function timerHTML(withText) {
+    if (!S.turnDeadline || !S.view) return '';
+    const left = Math.max(0, S.turnDeadline - Date.now());
+    const total = S.view.turnMs || 30000;
+    const from = Math.min(1, left / total).toFixed(3);
+    const low = left < 10000 ? ' low' : '';
+    const bar = `<span class="tbar"><i style="--from:${from};animation-duration:${Math.round(left)}ms"></i></span>`;
+    return withText
+      ? `<div class="turnline${low}" data-timer><span class="cd">${Math.ceil(left / 1000)} s</span>${bar}</div>`
+      : `<div class="seattimer${low}" data-timer>${bar}</div>`;
   }
 
   function render() {
@@ -880,7 +1086,7 @@
     const n = v.players.length;
     const hostName = v.players[0] ? v.players[0].name : 'il banco';
     const list = v.players.map((p, i) => `<li><span class="dot${p.connected ? ' on' : ''}"></span><span>${esc(p.name)}${p.id === S.myId ? ' <small>(tu)</small>' : ''}${i === 0 ? ' <small>fa da banco</small>' : ''}</span></li>`).join('');
-    const rules = `${fmt(v.startChips)} fiches a testa, bui ${fmt(v.sb)}/${fmt(v.bb)}${v.blindEvery ? `, raddoppiano ogni ${v.blindEvery} mani` : ''}.`;
+    const rules = `${fmt(v.startChips)} fiches a testa, bui ${fmt(v.sb)}/${fmt(v.bb)}${v.blindEvery ? `, raddoppiano ogni ${v.blindEvery} mani` : ''}. ${Math.round((v.turnMs || 30000) / 1000)} secondi per turno.`;
     const codeCards = String(S.code || '').split('').map((ch) => `<span>${esc(ch)}</span>`).join('');
     return `<main class="page">
       <h2>${host ? 'Il tavolo è aperto' : 'Sei al tavolo'}</h2>
@@ -944,6 +1150,7 @@
       <header class="topbar">
         <button class="codebtn" data-act="share" aria-label="Invita al tavolo ${esc(S.code)}">Tavolo<span>${esc(S.code)}</span></button>
         <span class="meta">${v.handNo ? 'Mano ' + v.handNo + ', ' : ''}bui ${fmt(v.sb)}/${fmt(v.bb)}</span>
+        <button class="iconbtn" data-act="sound" aria-pressed="${Sound.on}" aria-label="${Sound.on ? 'Suoni attivi: tocca per disattivarli' : 'Suoni disattivati: tocca per attivarli'}">${Sound.on ? ICON_SOUND : ICON_MUTE}</button>
         <button class="linkbtn" data-act="leave">Esci</button>
       </header>
       ${statusBanner()}
@@ -983,8 +1190,9 @@
     else if (p.hasCards) minis = backHTML('sm') + backHTML('sm');
     return `<div class="${cls.join(' ')}">
       <div class="r1"><span class="nm">${p.dealer ? '<span class="dealer" title="Mazziere">D</span>' : ''}${esc(p.name)}</span><span class="minis">${minis}</span></div>
-      <div class="r2"><span class="chips">${fmt(p.chips)}</span>${p.bet ? `<span class="bet">${fmt(p.bet)}</span>` : ''}${S.role === 'host' && !p.connected && !(v.phase === 'playing' && p.inHand) ? `<button class="kick" data-act="kick" data-id="${esc(p.id)}">Togli</button>` : ''}</div>
+      <div class="r2"><span class="chipsline">${miniPileHTML(p.chips, v.startChips)}<span class="chips">${fmt(p.chips)}</span></span>${p.bet ? `<span class="bet">${fmt(p.bet)}</span>` : ''}${S.role === 'host' && !p.connected && !(v.phase === 'playing' && p.inHand) ? `<button class="kick" data-act="kick" data-id="${esc(p.id)}">Togli</button>` : ''}</div>
       <div class="st">${esc(st)}</div>
+      ${turn ? timerHTML(false) : ''}
     </div>`;
   }
 
@@ -1009,8 +1217,9 @@
         <div class="nm">${me.dealer ? '<span class="dealer" title="Mazziere">D</span>' : ''}${esc(me.name)} <small>(tu)</small></div>
         <div class="chips">${fmt(me.chips)}<small>fiches</small></div>
         <div class="hs">${esc(hs)}</div>
+        ${me.bet ? `<span class="bet">${fmt(me.bet)}</span>` : ''}
       </div>
-      ${me.bet ? `<span class="bet">${fmt(me.bet)}</span>` : ''}
+      <div class="mypile" title="${fmt(me.chips)} fiches">${pileHTML(me.chips, v.startChips)}</div>
     </section>`;
   }
 
@@ -1022,7 +1231,7 @@
     if (S.role === 'guest' && S.status !== 'ok') return '<p class="msg">Aspetto di ricollegarmi al tavolo…</p>';
     const a = v.actions;
     if (a && S.raiseOpen) {
-      return `<div class="raise" role="group" aria-label="Scegli quanto puntare">
+      return `${timerHTML(true)}<div class="raise" role="group" aria-label="Scegli quanto puntare">
         <div class="rv"><span>${a.isBet ? 'Punta' : 'Rilancia a'}</span><b id="raiseVal">${fmt(S.raiseTo)}</b></div>
         <input type="range" id="raiseRange" min="${a.minTo}" max="${a.maxTo}" step="${v.sb}" value="${S.raiseTo}" aria-label="Importo">
         <div class="quick">
@@ -1044,7 +1253,7 @@
         if (a.minTo >= a.maxTo) btns.push(`<button class="btn primary" data-act="allin">All-in<small>${fmt(a.maxTo)}</small></button>`);
         else btns.push(`<button class="btn primary" data-act="raise-open">${a.isBet ? 'Punta' : 'Rilancia'}</button>`);
       }
-      return `<div class="acts">${btns.join('')}</div>`;
+      return `${timerHTML(true)}<div class="acts">${btns.join('')}</div>`;
     }
 
     const parts = [];
@@ -1053,7 +1262,6 @@
       if (v.runout) parts.push('<p class="msg">Si scoprono le carte…</p>');
       else if (turnP) {
         parts.push(`<p class="msg">Tocca a <strong>${esc(turnP.name)}</strong></p>`);
-        if (host && turnP.id !== S.myId) parts.push(`<button class="textlink" data-act="force">${esc(turnP.name)} non risponde? Fallo passare</button>`);
       }
     } else if (v.phase === 'handover') {
       parts.push(`<p class="msg">${v.champion ? 'Partita finita.' : 'Prossima mano tra pochi secondi…'}</p>`);
@@ -1128,14 +1336,8 @@
         send(C.conn, { t: 'rebuy' });
       }
     },
-    force() {
-      const t = H.table;
-      if (!t || t.toAct < 0) return;
-      const p = t.players[t.toAct];
-      if (!confirm('Far passare ' + p.name + ' in questa mano?')) return;
-      hostAutoAct(true);
-    },
     retry() { clientRetry(); },
+    sound() { toast(Sound.toggle() ? 'Suoni attivi' : 'Suoni disattivati'); render(); },
     'cancel-join'() { log('Ingresso annullato'); joinFailed(''); },
     kick(b) {
       const p = H.table && H.table.players.find((x) => x.id === b.dataset.id);
@@ -1159,6 +1361,7 @@
 
   app.addEventListener('click', (e) => {
     if (S.joined) acquireWake();
+    Sound.unlock();
     const b = e.target.closest('[data-act]');
     if (!b || b.disabled) return;
     const fn = actions[b.dataset.act];

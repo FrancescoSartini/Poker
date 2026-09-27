@@ -213,8 +213,22 @@ h3 { font: 600 17px/1.3 var(--sans); margin: 8px 0 0; }
   color: var(--muted);
 }
 .codebtn span { font: 700 17px var(--serif); letter-spacing: .12em; color: var(--text); margin-left: 4px; }
-.topbar .meta { flex: 1; text-align: center; font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.topbar .meta { flex: 1; min-width: 0; text-align: center; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .linkbtn { background: none; border: 1px solid var(--line); border-radius: 10px; padding: 7px 12px; font-size: 15px; }
+.iconbtn { background: none; border: 0; padding: 6px; width: 38px; height: 38px; display: grid; place-items: center; color: var(--muted); border-radius: 10px; }
+.iconbtn svg { width: 22px; height: 22px; }
+.iconbtn[aria-pressed="true"] { color: var(--text); }
+
+/* Conto alla rovescia del turno */
+.tbar { display: block; height: 4px; border-radius: 2px; background: rgba(237, 230, 211, .1); overflow: hidden; }
+.tbar i { display: block; height: 100%; background: var(--brass); transform-origin: left center; animation-name: shrink; animation-timing-function: linear; animation-fill-mode: forwards; }
+.low .tbar i { background: #E0604F; }
+@keyframes shrink { from { transform: scaleX(var(--from, 1)); } to { transform: scaleX(0); } }
+.seattimer { margin-top: 3px; }
+.turnline { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--muted); }
+.turnline .cd { min-width: 3.2em; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+.turnline .tbar { flex: 1; }
+.turnline.low .cd { color: #F2A99B; }
 .banner {
   margin: 0 12px 8px;
   padding: 10px 12px;
@@ -352,6 +366,12 @@ h3 { font: 600 17px/1.3 var(--sans); margin: 8px 0 0; }
 .me .chips small { font: 400 14px var(--sans); color: var(--muted); margin-left: 4px; }
 .me .hs { font-size: 15px; color: var(--brass-hi); min-height: 1.4em; }
 .me .empty { width: 154px; color: var(--muted); font-size: 14px; }
+.me .bet { margin-top: 2px; }
+.me { flex-wrap: wrap; }
+.mypile { flex-basis: 100%; display: flex; justify-content: center; margin-top: 2px; }
+.pile { display: block; width: 150px; height: auto; filter: drop-shadow(0 4px 6px rgba(0, 0, 0, .35)); }
+.chipsline { display: inline-flex; align-items: flex-end; gap: 5px; }
+.minipile { display: inline-block; width: 13px; height: 19px; flex: none; }
 
 .bar {
   position: fixed;
