@@ -13,5 +13,5 @@
    Lascia le virgolette: per esempio  meteredApp: 'pokermara',  */
 window.PTA_CONFIG = {
   meteredApp: 'trytobluff',
-  meteredKey: 'sk_id_ea94ec8c0f506c1bf191c0224de11bb1',
+  meteredKey: '6ab8fb771000a14e59991aef',
 };
