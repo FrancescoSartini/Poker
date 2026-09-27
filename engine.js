@@ -166,6 +166,8 @@
       if (this.phase === 'playing' && this.players[i].inHand) return;
       this.players.splice(i, 1);
       if (this.dealer >= i) this.dealer--;
+      if (this.dealer < 0 && this.players.length) this.dealer = this.players.length - 1;
+      if (this.toAct > i) this.toAct--;
       this.seq++;
     }
 

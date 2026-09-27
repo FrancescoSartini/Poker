@@ -11,6 +11,10 @@
   const RUNOUT_MS = 1300;
   const AUTO_MS = 1500;
   const PING_MS = 5000;
+  const STALE_MS = 12000;
+  const JOIN_RETRIES = 3;
+  const VERSION = '1.1';
+  const FATAL = new Set(['browser-incompatible', 'invalid-id', 'invalid-key', 'ssl-unavailable', 'unavailable-id']);
 
   const $ = (s, el = document) => el.querySelector(s);
   const app = $('#app');
@@ -40,6 +44,7 @@
     code: null,
     myId: null,
     joined: false,
+    joinNote: '',
     view: null,
     status: 'ok',
     raiseOpen: false,
@@ -172,9 +177,42 @@
   }
 
   function hostOnConn(conn) {
+    conn.on('open', () => hostConnOpened(conn));
     conn.on('data', (msg) => hostOnMsg(conn, msg));
     conn.on('close', () => hostOnClose(conn));
-    conn.on('error', () => hostOnClose(conn));
+    // Un errore sul canale non vuol dire che il giocatore se n'è andato:
+    // lo decidono la chiusura vera o il controllo periodico (hostPing).
+    conn.on('error', (err) => { try { console.warn('Collegamento con un giocatore:', err && err.type); } catch (e) { /* ignora */ } });
+  }
+
+  // Il messaggio di benvenuto parte solo quando il canale è davvero aperto
+  // anche dal lato del banco; prima andrebbe perso in silenzio.
+  function hostConnOpened(conn) {
+    const info = H.conns.get(conn);
+    if (!info || info.welcomed || !conn.open) return;
+    info.welcomed = true;
+    send(conn, { t: 'welcome', pid: info.pid, code: S.code });
+    hostTick();
+  }
+
+  function lastSeen(pid) {
+    let t = 0;
+    for (const i of H.conns.values()) if (i.pid === pid) t = Math.max(t, i.seen);
+    return t;
+  }
+
+  // Riconosce chi rientra: prima dal codice del dispositivo, poi dal nome.
+  // Il nome serve quando lo stesso telefono apre l'app da un posto diverso
+  // (Safari, app installata, browser interno di WhatsApp): ognuno ha la sua memoria.
+  function findReturning(key, name) {
+    const t = H.table;
+    const pid = H.byCid.get(key);
+    const byId = pid && t.players.find((x) => x.id === pid);
+    if (byId) return byId;
+    const lower = name.toLowerCase();
+    const now = Date.now();
+    return t.players.find((x) => x.id !== S.myId && x.name.toLowerCase() === lower &&
+      (!x.connected || now - lastSeen(x.id) > STALE_MS)) || null;
   }
 
   function uniqueName(name) {
@@ -195,8 +233,10 @@
 
     if (msg.t === 'hello') {
       const key = String(msg.cid || '').slice(0, 40);
-      let pid = H.byCid.get(key);
-      let p = pid && t.players.find((x) => x.id === pid);
+      const name = cleanName(msg.name);
+      let p = findReturning(key, name);
+      let pid = p ? p.id : null;
+      if (p) H.byCid.set(key, pid);
       if (!p) {
         if (t.players.length >= t.maxPlayers) {
           send(conn, { t: 'deny', reason: 'Il tavolo è pieno: massimo ' + t.maxPlayers + ' giocatori.' });
@@ -204,17 +244,17 @@
           return;
         }
         pid = 'p' + rid(10);
-        p = t.addPlayer(pid, uniqueName(cleanName(msg.name)));
+        p = t.addPlayer(pid, uniqueName(name));
         H.byCid.set(key, pid);
       }
       for (const [c, i] of H.conns) {
         if (i.pid === pid && c !== conn) { H.conns.delete(c); try { c.close(); } catch (e) { /* ignora */ } }
       }
-      H.conns.set(conn, { pid, seen: Date.now() });
+      H.conns.set(conn, { pid, seen: Date.now(), welcomed: false });
       p.connected = true;
       t.seq++;
-      send(conn, { t: 'welcome', pid, code: S.code });
-      hostTick();
+      if (conn.open) hostConnOpened(conn);
+      else hostTick();
       return;
     }
     if (!info) return;
@@ -287,8 +327,19 @@
     if (t.phase === 'playing' && !t.runout && t.toAct >= 0 && !t.players[t.toAct].connected && !H.timers.auto) {
       H.timers.auto = setTimeout(() => { delete H.timers.auto; hostAutoAct(false); }, AUTO_MS);
     }
-    for (const [conn, info] of H.conns) send(conn, { t: 'view', v: t.viewFor(info.pid) });
+    for (const [conn, info] of H.conns) if (info.welcomed) send(conn, { t: 'view', v: t.viewFor(info.pid) });
     onView(t.viewFor(S.myId));
+  }
+
+  function hostRemove(pid) {
+    const t = H.table;
+    if (!t) return;
+    const p = t.players.find((x) => x.id === pid);
+    if (!p || p.id === S.myId || (t.phase === 'playing' && p.inHand)) return;
+    for (const [c, i] of [...H.conns]) if (i.pid === pid) { H.conns.delete(c); send(c, { t: 'closed' }); try { c.close(); } catch (e) { /* ignora */ } }
+    for (const [k, v] of [...H.byCid]) if (v === pid) H.byCid.delete(k);
+    t.removePlayer(pid);
+    hostTick();
   }
 
   function hostAutoAct(force) {
@@ -306,26 +357,59 @@
     if (!P) { S.error = 'Non riesco a caricare il collegamento. Controlla internet e ricarica la pagina.'; return render(); }
     S.busy = true;
     S.error = '';
+    S.joinNote = '';
     S.code = S.joinCode;
     S.role = 'guest';
     C.closing = false;
     C.tries = 0;
+    C.attempts = 0;
+    C.lastErr = null;
     render();
     const peer = new P({ debug: 1 });
     C.peer = peer;
-    peer.on('open', () => clientConnect());
+    let opened = false;
+    peer.on('open', () => { opened = true; clientConnect(); });
     peer.on('error', (err) => {
       if (C.peer !== peer || C.closing) return;
-      if (!S.joined) {
-        clientTeardown();
-        S.busy = false;
-        S.error = peerError(err);
-        render();
-      }
+      const type = err && err.type;
+      C.lastErr = type;
+      if (S.joined) return; // a partita iniziata ci pensa il ricollegamento automatico
+      if (!opened || FATAL.has(type)) return joinFailed(peerError(err));
+      // "Tavolo non trovato" può arrivare anche quando il collegamento sta andando a buon fine
+      // (per esempio se il banco è appena tornato nell'app): conta solo se il canale non si è aperto.
+      if (C.conn && !C.conn.open) joinAttemptFailed(C.conn);
     });
     peer.on('disconnected', () => {
       if (!C.closing && C.peer === peer) setTimeout(() => { try { if (peer.disconnected && !peer.destroyed) peer.reconnect(); } catch (e) { /* riprova */ } }, 1500);
     });
+  }
+
+  function joinFailed(msg) {
+    clientTeardown();
+    S.busy = false;
+    S.joinNote = '';
+    S.error = msg;
+    render();
+  }
+
+  // Durante l'ingresso non ci si arrende al primo intoppo: si riprova qualche volta.
+  function joinAttemptFailed(conn) {
+    if (S.joined || C.closing || conn !== C.conn || conn._failed) return;
+    conn._failed = true;
+    try { conn.close(); } catch (e) { /* ignora */ }
+    if (C.attempts >= JOIN_RETRIES) {
+      return joinFailed(C.lastErr === 'peer-unavailable'
+        ? 'Il tavolo ' + S.code + ' non risponde. Controlla il codice e chiedi a chi l\'ha creato di tenere l\'app aperta.'
+        : 'Non riesco a raggiungere il tavolo. Controlla la connessione e riprova.');
+    }
+    C.attempts++;
+    S.joinNote = 'Il tavolo non risponde ancora, riprovo…';
+    render();
+    setTimeout(() => {
+      if (C.closing || S.joined || !C.peer) return;
+      try { if (C.peer.disconnected && !C.peer.destroyed) C.peer.reconnect(); } catch (e) { /* ignora */ }
+      clientConnect();
+    }, 2500);
   }
 
   function clientConnect() {
@@ -334,29 +418,28 @@
     C.conn = conn;
     let dead = false;
     const lost = () => {
-      if (dead) return;
+      if (dead || C.conn !== conn) return;
+      if (!S.joined) return joinAttemptFailed(conn);
       dead = true;
-      if (C.conn === conn) onClientLost();
+      onClientLost();
     };
-    const timer = setTimeout(() => { if (!conn.open) { try { conn.close(); } catch (e) { /* ignora */ } lost(); } }, 12000);
+    // Tempo massimo per aprire il canale e ricevere il benvenuto.
+    const timer = setTimeout(() => { if (!S.joined || !conn.open) lost(); }, 15000);
     conn.on('open', () => {
-      clearTimeout(timer);
       C.seen = Date.now();
       send(conn, { t: 'hello', name: cleanName(S.name), cid });
     });
-    conn.on('data', (msg) => { C.seen = Date.now(); clientOnMsg(msg); });
-    conn.on('close', lost);
-    conn.on('error', lost);
+    conn.on('data', (msg) => {
+      C.seen = Date.now();
+      if (msg && msg.t === 'welcome') clearTimeout(timer);
+      clientOnMsg(msg);
+    });
+    conn.on('close', () => { clearTimeout(timer); lost(); });
+    conn.on('error', () => { if (!conn.open) { clearTimeout(timer); lost(); } });
   }
 
   function onClientLost() {
     if (C.closing) return;
-    if (!S.joined) {
-      clientTeardown();
-      S.busy = false;
-      S.error = 'Non riesco a raggiungere il tavolo. Controlla il codice e la connessione.';
-      return render();
-    }
     if (C.tries >= 6) { S.status = 'lost'; return render(); }
     S.status = 'reconnecting';
     render();
@@ -379,6 +462,7 @@
         C.ping = setInterval(clientPing, PING_MS);
       }
       S.busy = false;
+      S.joinNote = '';
       S.status = 'ok';
       C.tries = 0;
       acquireWake();
@@ -543,9 +627,11 @@
       <label class="field"><span>Codice del tavolo</span>
         <input id="code" class="code" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go" value="${esc(S.joinCode)}" placeholder="5 lettere o numeri"></label>
       ${joinBtn}
+      ${S.busy && S.joinNote ? `<p class="muted small">${esc(S.joinNote)}</p>` : ''}
       <p class="err" role="alert">${esc(S.error)}</p>
       <div class="divider">oppure</div>
       <button class="btn ghost" data-act="go-create" ${S.busy ? 'disabled' : ''}>Crea un nuovo tavolo</button>
+      <p class="version">Versione ${VERSION}</p>
     </main>`;
   }
 
@@ -674,7 +760,7 @@
     else if (p.hasCards) minis = backHTML('sm') + backHTML('sm');
     return `<div class="${cls.join(' ')}">
       <div class="r1"><span class="nm">${p.dealer ? '<span class="dealer" title="Mazziere">D</span>' : ''}${esc(p.name)}</span><span class="minis">${minis}</span></div>
-      <div class="r2"><span class="chips">${fmt(p.chips)}</span>${p.bet ? `<span class="bet">${fmt(p.bet)}</span>` : ''}</div>
+      <div class="r2"><span class="chips">${fmt(p.chips)}</span>${p.bet ? `<span class="bet">${fmt(p.bet)}</span>` : ''}${S.role === 'host' && !p.connected && !(v.phase === 'playing' && p.inHand) ? `<button class="kick" data-act="kick" data-id="${esc(p.id)}">Togli</button>` : ''}</div>
       <div class="st">${esc(st)}</div>
     </div>`;
   }
@@ -826,6 +912,12 @@
       hostAutoAct(true);
     },
     retry() { clientRetry(); },
+    kick(b) {
+      const p = H.table && H.table.players.find((x) => x.id === b.dataset.id);
+      if (!p) return;
+      if (!confirm('Togliere ' + p.name + ' dal tavolo? Se rientra, riparte con le fiches iniziali.')) return;
+      hostRemove(p.id);
+    },
   };
 
   function validName() {
