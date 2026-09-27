@@ -14,7 +14,7 @@
   const STALE_MS = 12000;
   const JOIN_WINDOW_MS = 120000;
   const RECONNECT_WINDOW_MS = 180000;
-  const VERSION = '1.5';
+  const VERSION = '1.6';
   const FATAL = new Set(['browser-incompatible', 'invalid-id', 'invalid-key', 'ssl-unavailable', 'unavailable-id']);
 
   const $ = (s, el = document) => el.querySelector(s);
@@ -63,6 +63,9 @@
     const hh = (n) => String(n).padStart(2, '0');
     LOG.push(hh(d.getHours()) + ':' + hh(d.getMinutes()) + ':' + hh(d.getSeconds()) + '  ' + msg);
     if (LOG.length > 60) LOG.shift();
+    // Aggiorna subito il riquadro, se è aperto sullo schermo.
+    const pre = document.querySelector('.diag pre');
+    if (pre) pre.textContent = LOG.join('\n');
   }
   function device() {
     const ua = navigator.userAgent;
@@ -74,22 +77,35 @@
   log('Versione ' + VERSION + ' su ' + device());
   function diagHTML() {
     if (!LOG.length) return '';
-    return `<details class="diag"><summary>Dettagli tecnici</summary><pre>${esc(LOG.join('\n'))}</pre></details>`;
+    return `<details class="diag"${S.diagOpen ? ' open' : ''}><summary>Dettagli tecnici</summary><pre>${esc(LOG.join('\n'))}</pre></details>`;
   }
 
   /* ---------- Server ponte (TURN) ----------
      Serve quando i dispositivi non riescono a collegarsi direttamente
      (dati mobili, reti Wi-Fi diverse). Si attiva compilando config.js. */
-  const PEERJS_TURN = { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' };
   let ice = { list: null, at: 0, pending: null };
 
-  function turnConfigured() {
-    const cfg = window.PTA_CONFIG || {};
-    return !!(String(cfg.meteredApp || '').trim() && String(cfg.meteredKey || '').trim());
+  function cfgValue(k) { const cfg = window.PTA_CONFIG || {}; return String(cfg[k] || '').trim(); }
+  const hasStaticTurn = () => !!(cfgValue('turnUser') && cfgValue('turnPass'));
+  const hasApiTurn = () => !!(cfgValue('meteredApp') && cfgValue('meteredKey'));
+  function turnConfigured() { return hasStaticTurn() || hasApiTurn(); }
+
+  // Server di Metered con nome utente e password di una credenziale (dalla loro documentazione).
+  function staticTurn() {
+    const u = cfgValue('turnUser');
+    const p = cfgValue('turnPass');
+    return [
+      { urls: 'stun:stun.relay.metered.ca:80' },
+      { urls: 'turn:global.relay.metered.ca:80', username: u, credential: p },
+      { urls: 'turn:global.relay.metered.ca:80?transport=tcp', username: u, credential: p },
+      { urls: 'turn:global.relay.metered.ca:443', username: u, credential: p },
+      { urls: 'turns:global.relay.metered.ca:443?transport=tcp', username: u, credential: p },
+    ];
   }
 
   function loadIceServers() {
-    if (!turnConfigured()) return Promise.resolve(null);
+    if (hasStaticTurn()) return Promise.resolve(staticTurn());
+    if (!hasApiTurn()) return Promise.resolve(null);
     if (ice.list && Date.now() - ice.at < 10 * 60 * 1000) return Promise.resolve(ice.list);
     if (ice.pending) return ice.pending;
     const cfg = window.PTA_CONFIG;
@@ -113,13 +129,35 @@
   function peerOptions(list) {
     const o = { debug: 1 };
     if (list && list.length) {
-      o.config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }].concat(list, [PEERJS_TURN]), sdpSemantics: 'unified-plan' };
+      o.config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }].concat(list), sdpSemantics: 'unified-plan' };
     }
     return o;
   }
 
+  // Prova rapida: chiede al server ponte un indirizzo di inoltro. Se lo ottiene,
+  // nome utente e password sono giusti e il server è raggiungibile da questa rete.
+  function probeTurn(list) {
+    if (typeof RTCPeerConnection === 'undefined') return;
+    let pc;
+    try { pc = new RTCPeerConnection({ iceServers: list, iceTransportPolicy: 'relay' }); } catch (e) { return log('Server ponte: configurazione non valida'); }
+    let ok = false;
+    pc.onicecandidate = (e) => {
+      if (!ok && e.candidate && /typ relay/.test(e.candidate.candidate)) {
+        ok = true;
+        log('Server ponte verificato: funziona');
+        try { pc.close(); } catch (err) { /* ignora */ }
+      }
+    };
+    try { pc.createDataChannel('prova'); } catch (e) { /* ignora */ }
+    pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => { /* ignora */ });
+    setTimeout(() => {
+      if (!ok) log('Server ponte: nessuna risposta. Controlla nome utente e password in config.js');
+      try { pc.close(); } catch (e) { /* ignora */ }
+    }, 8000);
+  }
+
   function logIceSetup(list) {
-    if (list && list.length) log('Server ponte attivo');
+    if (list && list.length) { log('Server ponte attivo'); probeTurn(list); }
     else if (turnConfigured()) log('Server ponte configurato ma non disponibile: uso solo i server gratuiti di PeerJS');
     else log('Server ponte non configurato');
   }
@@ -1126,6 +1164,11 @@
     const fn = actions[b.dataset.act];
     if (fn) fn(b, e);
   });
+
+  // Il riquadro dei dettagli tecnici resta aperto anche quando lo schermo si aggiorna.
+  app.addEventListener('toggle', (e) => {
+    if (e.target && e.target.classList && e.target.classList.contains('diag')) S.diagOpen = e.target.open;
+  }, true);
 
   app.addEventListener('input', (e) => {
     const el = e.target;
