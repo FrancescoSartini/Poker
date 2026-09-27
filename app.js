@@ -12,8 +12,8 @@
   const AUTO_MS = 1500;
   const PING_MS = 5000;
   const STALE_MS = 12000;
-  const JOIN_RETRIES = 3;
-  const VERSION = '1.1';
+  const JOIN_WINDOW_MS = 120000;
+  const VERSION = '1.2';
   const FATAL = new Set(['browser-incompatible', 'invalid-id', 'invalid-key', 'ssl-unavailable', 'unavailable-id']);
 
   const $ = (s, el = document) => el.querySelector(s);
@@ -54,6 +54,27 @@
 
   const H = { peer: null, table: null, conns: new Map(), byCid: new Map(), timers: {}, ping: null };
   const C = { peer: null, conn: null, tries: 0, closing: false, seen: 0, ping: null };
+
+  /* ---------- Registro tecnico (per capire dove si blocca un collegamento) ---------- */
+  const LOG = [];
+  function log(msg) {
+    const d = new Date();
+    const hh = (n) => String(n).padStart(2, '0');
+    LOG.push(hh(d.getHours()) + ':' + hh(d.getMinutes()) + ':' + hh(d.getSeconds()) + '  ' + msg);
+    if (LOG.length > 60) LOG.shift();
+  }
+  function device() {
+    const ua = navigator.userAgent;
+    const os = /iPhone|iPad|iPod/.test(ua) ? 'iPhone/iPad' : /Android/.test(ua) ? 'Android' : 'Computer';
+    const br = /CriOS|Chrome/.test(ua) && !/Edg/.test(ua) ? 'Chrome' : /Firefox|FxiOS/.test(ua) ? 'Firefox' : /Safari/.test(ua) ? 'Safari' : 'altro browser';
+    const pwa = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone ? ', app installata' : '';
+    return os + ', ' + br + pwa;
+  }
+  log('Versione ' + VERSION + ' su ' + device());
+  function diagHTML() {
+    if (!LOG.length) return '';
+    return `<details class="diag"><summary>Dettagli tecnici</summary><pre>${esc(LOG.join('\n'))}</pre></details>`;
+  }
 
   /* ---------- Carte ---------- */
   const SUIT = {
@@ -143,7 +164,11 @@
       const peer = new P(PREFIX + code, { debug: 1 });
       let opened = false;
       peer.on('open', () => {
+        // PeerJS ripete l'evento "open" ogni volta che si ricollega al servizio:
+        // il tavolo va preparato solo la prima volta.
+        if (opened) { log('Tavolo di nuovo raggiungibile'); return; }
         opened = true;
+        log('Tavolo ' + code + ' aperto');
         H.peer = peer;
         H.table = table;
         S.code = code;
@@ -159,11 +184,13 @@
         acquireWake();
         hostTick();
       });
-      peer.on('connection', (conn) => hostOnConn(conn));
+      peer.on('connection', (conn) => { log('Qualcuno sta entrando'); hostOnConn(conn); });
       peer.on('disconnected', () => {
+        if (H.peer === peer && !peer.destroyed) log('Tavolo non raggiungibile: mi ricollego');
         if (!peer.destroyed && H.peer === peer) setTimeout(() => { try { if (peer.disconnected && !peer.destroyed) peer.reconnect(); } catch (e) { /* riprova dopo */ } }, 1500);
       });
       peer.on('error', (err) => {
+        log('Errore del banco: ' + (err && err.type));
         if (!opened) {
           try { peer.destroy(); } catch (e) { /* ignora */ }
           if (err && err.type === 'unavailable-id' && attempt++ < 5) return tryOpen();
@@ -190,6 +217,8 @@
   function hostConnOpened(conn) {
     const info = H.conns.get(conn);
     if (!info || info.welcomed || !conn.open) return;
+    const p = H.table && H.table.players.find((x) => x.id === info.pid);
+    log((p ? p.name : 'Un giocatore') + ' è al tavolo');
     info.welcomed = true;
     send(conn, { t: 'welcome', pid: info.pid, code: S.code });
     hostTick();
@@ -275,6 +304,8 @@
     const info = H.conns.get(conn);
     if (!info || !H.table) return;
     H.conns.delete(conn);
+    const gone = H.table.players.find((x) => x.id === info.pid);
+    log((gone ? gone.name : 'Un giocatore') + ' si è scollegato');
     try { conn.close(); } catch (e) { /* ignora */ }
     const t = H.table;
     const p = t.players.find((x) => x.id === info.pid);
@@ -354,7 +385,7 @@
   /* ---------- Giocatore (client) ---------- */
   function clientJoin() {
     const P = PeerCtor();
-    if (!P) { S.error = 'Non riesco a caricare il collegamento. Controlla internet e ricarica la pagina.'; return render(); }
+    if (!P) { log('Libreria di collegamento non caricata'); S.error = 'Non riesco a caricare il collegamento. Controlla internet e ricarica la pagina.'; return render(); }
     S.busy = true;
     S.error = '';
     S.joinNote = '';
@@ -364,22 +395,30 @@
     C.tries = 0;
     C.attempts = 0;
     C.lastErr = null;
+    C.joinStart = Date.now();
+    log('Cerco il tavolo ' + S.code);
     render();
     const peer = new P({ debug: 1 });
     C.peer = peer;
     let opened = false;
-    peer.on('open', () => { opened = true; clientConnect(); });
+    peer.on('open', () => {
+      // Anche qui "open" si ripete dopo ogni ricollegamento: si parte una volta sola.
+      if (opened) { log('Di nuovo collegato al servizio'); return; }
+      opened = true;
+      log('Collegato al servizio');
+      clientConnect();
+    });
     peer.on('error', (err) => {
       if (C.peer !== peer || C.closing) return;
       const type = err && err.type;
       C.lastErr = type;
+      log('Errore: ' + type);
       if (S.joined) return; // a partita iniziata ci pensa il ricollegamento automatico
       if (!opened || FATAL.has(type)) return joinFailed(peerError(err));
-      // "Tavolo non trovato" può arrivare anche quando il collegamento sta andando a buon fine
-      // (per esempio se il banco è appena tornato nell'app): conta solo se il canale non si è aperto.
       if (C.conn && !C.conn.open) joinAttemptFailed(C.conn);
     });
     peer.on('disconnected', () => {
+      if (!C.closing && C.peer === peer) log('Collegamento al servizio perso');
       if (!C.closing && C.peer === peer) setTimeout(() => { try { if (peer.disconnected && !peer.destroyed) peer.reconnect(); } catch (e) { /* riprova */ } }, 1500);
     });
   }
@@ -392,30 +431,31 @@
     render();
   }
 
-  // Durante l'ingresso non ci si arrende al primo intoppo: si riprova qualche volta.
+  // Se il tavolo non risponde (di solito perché chi l'ha creato è uscito dall'app
+  // per mandare il link), si continua a provare per un paio di minuti.
   function joinAttemptFailed(conn) {
     if (S.joined || C.closing || conn !== C.conn || conn._failed) return;
     conn._failed = true;
     try { conn.close(); } catch (e) { /* ignora */ }
-    if (C.attempts >= JOIN_RETRIES) {
-      return joinFailed(C.lastErr === 'peer-unavailable'
-        ? 'Il tavolo ' + S.code + ' non risponde. Controlla il codice e chiedi a chi l\'ha creato di tenere l\'app aperta.'
-        : 'Non riesco a raggiungere il tavolo. Controlla la connessione e riprova.');
+    if (Date.now() - C.joinStart > JOIN_WINDOW_MS) {
+      log('Rinuncio dopo ' + (C.attempts + 1) + ' tentativi');
+      return joinFailed('Il tavolo ' + S.code + ' non risponde. Controlla il codice e chiedi a chi l\'ha creato di tenere l\'app aperta sullo schermo.');
     }
     C.attempts++;
-    S.joinNote = 'Il tavolo non risponde ancora, riprovo…';
+    S.joinNote = 'Il tavolo non risponde ancora. Se chi l\'ha creato è uscito dall\'app, chiedigli di riaprirla: intanto continuo a provare.';
     render();
     setTimeout(() => {
       if (C.closing || S.joined || !C.peer) return;
       try { if (C.peer.disconnected && !C.peer.destroyed) C.peer.reconnect(); } catch (e) { /* ignora */ }
       clientConnect();
-    }, 2500);
+    }, 3000);
   }
 
   function clientConnect() {
     if (C.closing || !C.peer) return;
     const conn = C.peer.connect(PREFIX + S.code, { reliable: true, serialization: 'json' });
     C.conn = conn;
+    if (!S.joined) log('Tentativo ' + (C.attempts + 1) + ': busso al tavolo');
     let dead = false;
     const lost = () => {
       if (dead || C.conn !== conn) return;
@@ -424,17 +464,18 @@
       onClientLost();
     };
     // Tempo massimo per aprire il canale e ricevere il benvenuto.
-    const timer = setTimeout(() => { if (!S.joined || !conn.open) lost(); }, 15000);
+    const timer = setTimeout(() => { if (!S.joined || !conn.open) { log('Nessuna risposta dal tavolo'); lost(); } }, 10000);
     conn.on('open', () => {
+      log('Canale aperto, mi presento');
       C.seen = Date.now();
       send(conn, { t: 'hello', name: cleanName(S.name), cid });
     });
     conn.on('data', (msg) => {
       C.seen = Date.now();
-      if (msg && msg.t === 'welcome') clearTimeout(timer);
+      if (msg && msg.t === 'welcome') { clearTimeout(timer); log('Entrato al tavolo'); }
       clientOnMsg(msg);
     });
-    conn.on('close', () => { clearTimeout(timer); lost(); });
+    conn.on('close', () => { clearTimeout(timer); if (C.conn === conn && !conn._failed) log('Canale chiuso'); lost(); });
     conn.on('error', () => { if (!conn.open) { clearTimeout(timer); lost(); } });
   }
 
@@ -627,11 +668,13 @@
       <label class="field"><span>Codice del tavolo</span>
         <input id="code" class="code" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go" value="${esc(S.joinCode)}" placeholder="5 lettere o numeri"></label>
       ${joinBtn}
-      ${S.busy && S.joinNote ? `<p class="muted small">${esc(S.joinNote)}</p>` : ''}
+      ${S.busy && S.role === 'guest' ? `<p class="muted small">${esc(S.joinNote || 'Busso al tavolo…')}</p><button class="btn ghost" data-act="cancel-join">Annulla</button>` : ''}
       <p class="err" role="alert">${esc(S.error)}</p>
+      ${S.error ? diagHTML() : ''}
       <div class="divider">oppure</div>
       <button class="btn ghost" data-act="go-create" ${S.busy ? 'disabled' : ''}>Crea un nuovo tavolo</button>
       <p class="version">Versione ${VERSION}</p>
+      ${!S.error ? diagHTML().replace('class="diag"', 'class="diag quiet"') : ''}
     </main>`;
   }
 
@@ -663,7 +706,7 @@
     const codeCards = String(S.code || '').split('').map((ch) => `<span>${esc(ch)}</span>`).join('');
     return `<main class="page">
       <h2>${host ? 'Il tavolo è aperto' : 'Sei al tavolo'}</h2>
-      <p class="muted">${host ? 'Gli amici entrano con questo codice, oppure con il link che gli mandi.' : 'Codice del tavolo'}</p>
+      <p class="muted">${host ? 'Gli amici entrano con questo codice o con il link. Dopo averlo mandato torna subito qui: mentre l\'app è chiusa, il tavolo non risponde.' : 'Codice del tavolo'}</p>
       <div class="codecards" aria-label="Codice ${esc(S.code)}">${codeCards}</div>
       <button class="btn ${host && n < 2 ? 'primary' : 'ghost'}" data-act="share">Invita gli amici</button>
       <h3>Al tavolo, ${n} su ${v.maxPlayers}</h3>
@@ -674,6 +717,7 @@
            <p class="note">Tieni l'app aperta durante la partita: il tuo telefono fa da banco.</p>`
         : `<p class="msg">Aspetta che <strong>${esc(hostName)}</strong> inizi la partita.</p>`}
       <button class="btn ghost" data-act="leave">${host ? 'Chiudi il tavolo' : 'Esci dal tavolo'}</button>
+      ${diagHTML()}
     </main>`;
   }
 
@@ -912,6 +956,7 @@
       hostAutoAct(true);
     },
     retry() { clientRetry(); },
+    'cancel-join'() { log('Ingresso annullato'); joinFailed(''); },
     kick(b) {
       const p = H.table && H.table.players.find((x) => x.id === b.dataset.id);
       if (!p) return;
@@ -980,6 +1025,7 @@
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
     if (S.joined) acquireWake();
+    if (S.role === 'host') log('App del banco di nuovo in primo piano');
     if (S.role === 'host' && H.peer && H.peer.disconnected && !H.peer.destroyed) { try { H.peer.reconnect(); } catch (e) { /* ignora */ } }
     if (S.role === 'guest' && S.joined && S.status === 'ok' && C.conn && !C.conn.open) onClientLost();
   });
